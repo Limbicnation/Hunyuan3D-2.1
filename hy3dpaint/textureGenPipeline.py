@@ -17,15 +17,16 @@ import torch
 import copy
 import trimesh
 import numpy as np
+import gc
 from PIL import Image
 from typing import List
-from DifferentiableRenderer.MeshRender import MeshRender
-from utils.simplify_mesh_utils import remesh_mesh
-from utils.multiview_utils import multiviewDiffusionNet
-from utils.pipeline_utils import ViewProcessor
-from utils.image_super_utils import imageSuperNet
-from utils.uvwrap_utils import mesh_uv_wrap
-from DifferentiableRenderer.mesh_utils import convert_obj_to_glb
+from .DifferentiableRenderer.MeshRender import MeshRender
+from .utils.simplify_mesh_utils import remesh_mesh
+from .utils.multiview_utils import multiviewDiffusionNet
+from .utils.pipeline_utils import ViewProcessor
+from .utils.image_super_utils import imageSuperNet
+from .utils.uvwrap_utils import mesh_uv_wrap
+from .convert_utils import create_glb_with_pbr_materials
 import warnings
 
 warnings.filterwarnings("ignore")
@@ -46,10 +47,11 @@ class Hunyuan3DPaintConfig:
 
         self.raster_mode = "cr"
         self.bake_mode = "back_sample"
-        self.render_size = 1024 * 2
-        self.texture_size = 1024 * 4
-        self.max_selected_view_num = max_num_view
-        self.resolution = resolution
+        # Reduce texture sizes to save GPU memory
+        self.render_size = min(1024 * 2, 1536)  # Reduce from 2048 to 1536 max
+        self.texture_size = min(1024 * 4, 2048)  # Reduce from 4096 to 2048 max
+        self.max_selected_view_num = min(max_num_view, 6)  # Limit views to 6 max
+        self.resolution = min(resolution, 512)  # Limit resolution to 512 max
         self.bake_exp = 4
         self.merge_method = "fast"
 
@@ -82,12 +84,36 @@ class Hunyuan3DPaintPipeline:
         )
         self.view_processor = ViewProcessor(self.config, self.render)
         self.load_models()
+    
+    def _clear_memory(self):
+        """Clear GPU memory and garbage collect"""
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+        gc.collect()
 
     def load_models(self):
         torch.cuda.empty_cache()
         self.models["super_model"] = imageSuperNet(self.config)
         self.models["multiview_model"] = multiviewDiffusionNet(self.config)
+        
+        # Enable gradient checkpointing for memory efficiency
+        self._enable_gradient_checkpointing()
         print("Models Loaded.")
+        
+    def _enable_gradient_checkpointing(self):
+        """Enable gradient checkpointing for models if supported"""
+        for model_name, model in self.models.items():
+            try:
+                if hasattr(model, 'enable_gradient_checkpointing'):
+                    model.enable_gradient_checkpointing()
+                    print(f"Enabled gradient checkpointing for {model_name}")
+                elif hasattr(model, 'pipeline') and hasattr(model.pipeline, 'unet'):
+                    if hasattr(model.pipeline.unet, 'enable_gradient_checkpointing'):
+                        model.pipeline.unet.enable_gradient_checkpointing()
+                        print(f"Enabled gradient checkpointing for {model_name} UNet")
+            except Exception as e:
+                print(f"Could not enable gradient checkpointing for {model_name}: {e}")
 
     @torch.no_grad()
     def __call__(self, mesh_path=None, image_path=None, output_mesh_path=None, use_remesh=True, save_glb=True):
@@ -145,6 +171,8 @@ class Hunyuan3DPaintPipeline:
         image_style = [image.convert("RGB") for image in image_style]
 
         ###########  Multiview  ##########
+        self._clear_memory()  # Clear memory before multiview generation
+        
         multiviews_pbr = self.models["multiview_model"](
             image_style,
             normal_maps + position_maps,
@@ -152,17 +180,30 @@ class Hunyuan3DPaintPipeline:
             custom_view_size=self.config.resolution,
             resize_input=True,
         )
+        
+        self._clear_memory()  # Clear memory after multiview generation
+        
         ###########  Enhance  ##########
         enhance_images = {}
-        enhance_images["albedo"] = copy.deepcopy(multiviews_pbr["albedo"])
-        enhance_images["mr"] = copy.deepcopy(multiviews_pbr["mr"])
+        # Avoid deep copy to save memory, use list() instead
+        enhance_images["albedo"] = list(multiviews_pbr["albedo"])
+        enhance_images["mr"] = list(multiviews_pbr["mr"])
+        
+        # Clear the original multiviews_pbr to free memory
+        del multiviews_pbr
+        self._clear_memory()
 
         for i in range(len(enhance_images["albedo"])):
             enhance_images["albedo"][i] = self.models["super_model"](enhance_images["albedo"][i])
             enhance_images["mr"][i] = self.models["super_model"](enhance_images["mr"][i])
+            # Clear memory after each enhancement to prevent accumulation
+            if i % 2 == 1:  # Clear every other iteration
+                self._clear_memory()
 
+        self._clear_memory()  # Clear memory after all enhancements
+        
         ###########  Bake  ##########
-        for i in range(len(enhance_images)):
+        for i in range(len(enhance_images["albedo"])):
             enhance_images["albedo"][i] = enhance_images["albedo"][i].resize(
                 (self.config.render_size, self.config.render_size)
             )
@@ -186,7 +227,14 @@ class Hunyuan3DPaintPipeline:
         self.render.save_mesh(output_mesh_path, downsample=True)
 
         if save_glb:
-            convert_obj_to_glb(output_mesh_path, output_mesh_path.replace(".obj", ".glb"))
-            output_glb_path = output_mesh_path.replace(".obj", ".glb")
+            # Use alternative GLB conversion that doesn't require bpy
+            glb_path = output_mesh_path.replace(".obj", ".glb")
+            textures = {
+                'albedo': output_mesh_path.replace('.obj', '.jpg'),
+                'metallic': output_mesh_path.replace('.obj', '_metallic.jpg'),
+                'roughness': output_mesh_path.replace('.obj', '_roughness.jpg')
+            }
+            create_glb_with_pbr_materials(output_mesh_path, textures, glb_path)
+            output_glb_path = glb_path
 
         return output_mesh_path

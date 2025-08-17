@@ -14,11 +14,18 @@
 
 import os
 import cv2
-import bpy
 import math
 import numpy as np
 from io import StringIO
 from typing import Optional, Tuple, Dict, Any
+
+# Handle optional bpy import
+try:
+    import bpy
+    HAS_BPY = True
+except ImportError:
+    HAS_BPY = False
+    print("Warning: bpy (Blender Python API) not available. GLB conversion will be disabled.")
 
 
 def _safe_extract_attribute(obj: Any, attr_path: str, default: Any = None) -> Any:
@@ -199,6 +206,8 @@ def save_mesh(mesh_path, vtx_pos, pos_idx, vtx_uv, uv_idx, texture, metallic=Non
 
 def _setup_blender_scene():
     """Setup Blender scene for conversion."""
+    if not HAS_BPY:
+        return
     if "convert" not in bpy.data.scenes:
         bpy.data.scenes.new("convert")
     bpy.context.window.scene = bpy.data.scenes["convert"]
@@ -206,6 +215,8 @@ def _setup_blender_scene():
 
 def _clear_scene_objects():
     """Clear all objects from current Blender scene."""
+    if not HAS_BPY:
+        return
     for obj in bpy.context.scene.objects:
         obj.select_set(True)
         bpy.data.objects.remove(obj, do_unlink=True)
@@ -213,6 +224,8 @@ def _clear_scene_objects():
 
 def _select_mesh_objects():
     """Select all mesh objects in scene."""
+    if not HAS_BPY:
+        return
     bpy.ops.object.select_all(action="DESELECT")
     for obj in bpy.context.scene.objects:
         if obj.type == "MESH":
@@ -221,7 +234,7 @@ def _select_mesh_objects():
 
 def _merge_vertices_if_needed(merge_vertices: bool):
     """Merge duplicate vertices if requested."""
-    if not merge_vertices:
+    if not HAS_BPY or not merge_vertices:
         return
 
     for obj in bpy.context.selected_objects:
@@ -235,6 +248,8 @@ def _merge_vertices_if_needed(merge_vertices: bool):
 
 def _apply_shading(shade_type: str, auto_smooth_angle: float):
     """Apply shading to selected objects."""
+    if not HAS_BPY:
+        return
     shading_ops = {
         "SMOOTH": lambda: bpy.ops.object.shade_smooth(),
         "FLAT": lambda: bpy.ops.object.shade_flat(),
@@ -247,6 +262,8 @@ def _apply_shading(shade_type: str, auto_smooth_angle: float):
 
 def _apply_auto_smooth(auto_smooth_angle: float):
     """Apply auto smooth based on Blender version."""
+    if not HAS_BPY:
+        return
     angle_rad = math.radians(auto_smooth_angle)
 
     if bpy.app.version < (4, 1, 0):
@@ -265,6 +282,10 @@ def convert_obj_to_glb(
     merge_vertices: bool = False,
 ) -> bool:
     """Convert OBJ file to GLB format using Blender."""
+    if not HAS_BPY:
+        print("Warning: Blender (bpy) not available. Cannot convert OBJ to GLB.")
+        return False
+        
     try:
         _setup_blender_scene()
         _clear_scene_objects()

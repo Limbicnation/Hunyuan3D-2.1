@@ -14,6 +14,10 @@
 
 # Apply torchvision compatibility fix before other imports
 
+# Set CUDA memory management environment variable to reduce fragmentation
+import os
+os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
+
 import sys
 sys.path.insert(0, './hy3dshape')
 sys.path.insert(0, './hy3dpaint')
@@ -33,6 +37,7 @@ import random
 import shutil
 import subprocess
 import time
+import gc
 from glob import glob
 from pathlib import Path
 
@@ -163,7 +168,6 @@ def export_mesh(mesh, save_folder, textured=False, type='glb'):
 
 
 
-
 def quick_convert_with_obj2gltf(obj_path: str, glb_path: str) -> bool:
     # 执行转换
     textures = {
@@ -179,6 +183,37 @@ def randomize_seed_fn(seed: int, randomize_seed: bool) -> int:
     if randomize_seed:
         seed = random.randint(0, MAX_SEED)
     return seed
+
+
+def clear_gpu_memory():
+    """Aggressive GPU memory cleanup to prevent OOM errors"""
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        gc.collect()
+        # Print memory stats for debugging
+        allocated = torch.cuda.memory_allocated() / 1024**3
+        cached = torch.cuda.memory_reserved() / 1024**3
+        print(f"GPU Memory - Allocated: {allocated:.2f} GB, Cached: {cached:.2f} GB")
+
+
+def adaptive_chunk_size(default_chunks=200000):
+    """Adaptively reduce chunk size based on available GPU memory"""
+    if not torch.cuda.is_available():
+        return default_chunks
+    
+    total_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3
+    allocated_memory = torch.cuda.memory_allocated() / 1024**3
+    free_memory = total_memory - allocated_memory
+    
+    # If less than 4GB free, reduce chunk size significantly
+    if free_memory < 4:
+        return min(default_chunks, 50000)
+    # If less than 8GB free, reduce chunk size moderately  
+    elif free_memory < 8:
+        return min(default_chunks, 100000)
+    else:
+        return default_chunks
 
 
 def build_model_viewer_html(save_folder, height=660, width=790, textured=False):
@@ -202,10 +237,10 @@ def build_model_viewer_html(save_folder, height=660, width=790, textured=False):
         f.write(template_html)
 
     rel_path = os.path.relpath(output_html_path, SAVE_DIR)
-    iframe_tag = f'<iframe src="/static/{rel_path}" \
-height="{height}" width="100%" frameborder="0"></iframe>'
-    print(f'Find html file {output_html_path}, \
-{os.path.exists(output_html_path)}, relative HTML path is /static/{rel_path}')
+    iframe_tag = f'''<iframe src="/static/{rel_path}"
+height="{height}" width="100%" frameborder="0"></iframe>'''
+    print((f'Find html file {output_html_path}, '
+           f'{os.path.exists(output_html_path)}, relative HTML path is /static/{rel_path}'))
 
     return f"""
         <div style='height: {height}; width: 100%;'>
@@ -232,8 +267,8 @@ def _gen_shape(
     if not MV_MODE and image is None and caption is None:
         raise gr.Error("Please provide either a caption or an image.")
     if MV_MODE:
-        if mv_image_front is None and mv_image_back is None \
-            and mv_image_left is None and mv_image_right is None:
+        if (mv_image_front is None and mv_image_back is None 
+            and mv_image_left is None and mv_image_right is None):
             raise gr.Error("Please provide at least one view image.")
         image = {}
         if mv_image_front:
@@ -272,8 +307,8 @@ def _gen_shape(
         try:
             image = t2i_worker(caption)
         except Exception as e:
-            raise gr.Error(f"Text to 3D is disable. \
-            Please enable it by `python gradio_app.py --enable_t23d`.")
+            raise gr.Error(f"Text to 3D is disable. "
+                           f"Please enable it by `python gradio_app.py --enable_t23d`.")
         time_meta['text2image'] = time.time() - start_time
 
     # remove disk io to make responding faster, uncomment at your will.
@@ -296,6 +331,14 @@ def _gen_shape(
 
     # image to white model
     start_time = time.time()
+    
+    # Clear memory before heavy computation
+    clear_gpu_memory()
+    
+    # Adaptively reduce chunk size based on available memory
+    adaptive_chunks = adaptive_chunk_size(num_chunks)
+    if adaptive_chunks != num_chunks:
+        print(f"Reducing chunk size from {num_chunks} to {adaptive_chunks} due to memory constraints")
 
     generator = torch.Generator()
     generator = generator.manual_seed(int(seed))
@@ -305,11 +348,14 @@ def _gen_shape(
         guidance_scale=guidance_scale,
         generator=generator,
         octree_resolution=octree_resolution,
-        num_chunks=num_chunks,
+        num_chunks=adaptive_chunks,
         output_type='mesh'
     )
     time_meta['shape generation'] = time.time() - start_time
     logger.info("---Shape generation takes %s seconds ---" % (time.time() - start_time))
+    
+    # Clear memory after shape generation
+    clear_gpu_memory()
 
     tmp_start = time.time()
     mesh = export_to_trimesh(outputs)[0]
@@ -375,6 +421,9 @@ def generation_all(
     logger.info("---Face Reduction takes %s seconds ---" % (time.time() - tmp_time))
     stats['time']['face reduction'] = time.time() - tmp_time
 
+    # Clear memory before texture generation (most memory-intensive operation)
+    clear_gpu_memory()
+    
     tmp_time = time.time()
 
     text_path = os.path.join(save_folder, f'textured_mesh.obj')
@@ -382,6 +431,9 @@ def generation_all(
         
     logger.info("---Texture Generation takes %s seconds ---" % (time.time() - tmp_time))
     stats['time']['texture generation'] = time.time() - tmp_time
+    
+    # Clear memory after texture generation
+    clear_gpu_memory()
 
     tmp_time = time.time()
     # Convert textured OBJ to GLB using obj2gltf with PBR support
@@ -527,8 +579,7 @@ def build_app():
                     with gr.Tab("Options", id='tab_options', visible=TURBO_MODE):
                         gen_mode = gr.Radio(
                             label='Generation Mode',
-                            info='Recommendation: Turbo for most cases, \
-Fast for very complex cases, Standard seldom use.',
+                            info='Recommendation: Turbo for most cases, \nFast for very complex cases, Standard seldom use.',
                             choices=['Turbo', 'Fast', 'Standard'], 
                             value='Turbo')
                         decode_mode = gr.Radio(
@@ -747,6 +798,7 @@ if __name__ == '__main__':
     parser.add_argument('--enable_flashvdm', action='store_true')
     parser.add_argument('--compile', action='store_true')
     parser.add_argument('--low_vram_mode', action='store_true')
+    parser.add_argument('--model_dir', type=str, default='./models', help='Directory to save and load models')
     args = parser.parse_args()
     args.enable_flashvdm = False
 
@@ -792,12 +844,13 @@ if __name__ == '__main__':
                 print(f"Warning: Failed to apply torchvision fix: {fix_error}")
             
             # from hy3dgen.texgen import Hunyuan3DPaintPipeline
-            # texgen_worker = Hunyuan3DPaintPipeline.from_pretrained(args.texgen_model_path)
+            # texgen_worker = Hunyuan3DPaintPipeline.from_pretrained(args.texgen_model_path, cache_dir=args.model_dir)
             # if args.low_vram_mode:
             #     texgen_worker.enable_model_cpu_offload()
 
             from hy3dpaint.textureGenPipeline import Hunyuan3DPaintPipeline, Hunyuan3DPaintConfig
-            conf = Hunyuan3DPaintConfig(max_num_view=8, resolution=768)
+            # Use memory-efficient settings
+            conf = Hunyuan3DPaintConfig(max_num_view=6, resolution=512)
             conf.realesrgan_ckpt_path = "hy3dpaint/ckpt/RealESRGAN_x4plus.pth"
             conf.multiview_cfg_path = "hy3dpaint/cfgs/hunyuan-paint-pbr.yaml"
             conf.custom_pipeline = "hy3dpaint/hunyuanpaintpbr"
@@ -812,19 +865,21 @@ if __name__ == '__main__':
             
             HAS_TEXTUREGEN = True
             
+        except ModuleNotFoundError as e:
+            print(f"Warning: Missing dependency for texture generation: {e}")
+            print("Texture generation will be disabled.")
+            HAS_TEXTUREGEN = False
         except Exception as e:
             import traceback
             traceback.print_exc()
             print(f"Error loading texture generator: {e}")
-            print("Failed to load texture generator.")
-            print('Please try to install requirements by following README.md')
             HAS_TEXTUREGEN = False
 
     HAS_T2I = True
     if args.enable_t23d:
         from hy3dgen.text2image import HunyuanDiTPipeline
 
-        t2i_worker = HunyuanDiTPipeline('Tencent-Hunyuan/HunyuanDiT-v1.1-Diffusers-Distilled')
+        t2i_worker = HunyuanDiTPipeline('Tencent-Hunyuan/HunyuanDiT-v1.1-Diffusers-Distilled', cache_dir=args.model_dir)
         HAS_T2I = True
 
     from hy3dshape import FaceReducer, FloaterRemover, DegenerateFaceRemover, MeshSimplifier, \
@@ -838,12 +893,25 @@ if __name__ == '__main__':
         subfolder=args.subfolder,
         use_safetensors=False,
         device=args.device,
+        cache_dir=args.model_dir,
     )
     if args.enable_flashvdm:
         mc_algo = 'mc' if args.device in ['cpu', 'mps'] else args.mc_algo
         i23d_worker.enable_flashvdm(mc_algo=mc_algo)
     if args.compile:
         i23d_worker.compile()
+    
+    # Enable gradient checkpointing if the model supports it (low VRAM mode)
+    if args.low_vram_mode:
+        try:
+            if hasattr(i23d_worker, 'enable_gradient_checkpointing'):
+                i23d_worker.enable_gradient_checkpointing()
+                print("Enabled gradient checkpointing for shape generation")
+            elif hasattr(i23d_worker, 'unet') and hasattr(i23d_worker.unet, 'enable_gradient_checkpointing'):
+                i23d_worker.unet.enable_gradient_checkpointing()
+                print("Enabled gradient checkpointing for UNet")
+        except Exception as e:
+            print(f"Could not enable gradient checkpointing: {e}")
 
     floater_remove_worker = FloaterRemover()
     degenerate_face_remove_worker = DegenerateFaceRemover()

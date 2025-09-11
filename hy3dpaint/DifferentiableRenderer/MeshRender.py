@@ -13,6 +13,7 @@
 # by Tencent in accordance with TENCENT HUNYUAN COMMUNITY LICENSE AGREEMENT.
 
 import cv2
+import os
 import torch
 import trimesh
 import numpy as np
@@ -29,12 +30,20 @@ from .camera_utils import (
 )
 
 try:
-    from .mesh_utils import load_mesh, save_mesh
+    if os.environ.get('HUNYUAN_DISABLE_BPY') != '1':
+        from .mesh_utils import load_mesh, save_mesh
+    else:
+        print("Bpy functionality disabled by safety mode")
+        load_mesh = None
+        save_mesh = None
 except:
     print("Bpy IO CAN NOT BE Imported!!!")
 
 try:
-    from .mesh_inpaint_processor import meshVerticeInpaint  # , meshVerticeColor
+    import sys
+    import os
+    sys.path.append(os.path.dirname(__file__))
+    from mesh_inpaint_processor import meshVerticeInpaint  # , meshVerticeColor
 except:
     print("InPaint Function CAN NOT BE Imported!!!")
 

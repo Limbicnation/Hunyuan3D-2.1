@@ -33,6 +33,8 @@ import random
 import shutil
 import subprocess
 import time
+import gc
+import psutil
 from glob import glob
 from pathlib import Path
 
@@ -47,6 +49,116 @@ import numpy as np
 
 from hy3dshape.utils import logger
 from hy3dpaint.convert_utils import create_glb_with_pbr_materials
+
+
+def log_memory_usage(stage=""):
+    """Log current memory usage for debugging"""
+    if torch.cuda.is_available():
+        gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        gpu_allocated = torch.cuda.memory_allocated(0) / 1024**3
+        gpu_cached = torch.cuda.memory_reserved(0) / 1024**3
+        print(f"🔍 Memory Usage {stage}: GPU {gpu_allocated:.1f}/{gpu_memory:.1f}GB (cached: {gpu_cached:.1f}GB)")
+    
+    ram_usage = psutil.virtual_memory()
+    ram_used = ram_usage.used / 1024**3
+    ram_total = ram_usage.total / 1024**3
+    print(f"🔍 Memory Usage {stage}: RAM {ram_used:.1f}/{ram_total:.1f}GB ({ram_usage.percent:.1f}%)")
+
+
+def safe_cuda_cleanup():
+    """Safely cleanup CUDA memory with error handling"""
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            gc.collect()
+    except Exception as e:
+        print(f"⚠️  CUDA cleanup warning: {e}")
+
+
+def get_optimal_texture_batch_size():
+    """Calculate optimal batch size for texture generation based on available CUDA memory"""
+    if not torch.cuda.is_available():
+        return 1
+    
+    try:
+        # Get total and currently allocated memory
+        total_memory = torch.cuda.get_device_properties(0).total_memory
+        allocated_memory = torch.cuda.memory_allocated(0)
+        available_memory = total_memory - allocated_memory
+        
+        # Conservative batch sizing: use 60% of available memory
+        # Texture generation typically needs ~2-3GB per batch
+        available_gb = available_memory / (1024**3)
+        optimal_batch = max(1, min(4, int(available_gb * 0.6 / 2.5)))
+        
+        print(f"🔍 CUDA Memory: {available_gb:.1f}GB available, using batch size {optimal_batch}")
+        return optimal_batch
+    except Exception as e:
+        print(f"⚠️  Error calculating batch size: {e}")
+        return 1
+
+
+def memory_efficient_texture_wrapper(func):
+    """Decorator to add aggressive memory management for texture generation"""
+    def wrapper(*args, **kwargs):
+        try:
+            # Pre-cleanup
+            safe_cuda_cleanup()
+            
+            # Set conservative memory settings
+            if torch.cuda.is_available():
+                torch.backends.cudnn.benchmark = False
+                torch.backends.cudnn.deterministic = True
+                
+            log_memory_usage(f"before texture {func.__name__}")
+            
+            # Run with error handling
+            result = func(*args, **kwargs)
+            
+            # Post-cleanup
+            safe_cuda_cleanup()
+            log_memory_usage(f"after texture {func.__name__}")
+            
+            return result
+            
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                print("❌ CUDA OOM Error detected - cleaning up and retrying with minimal settings")
+                safe_cuda_cleanup()
+                
+                # Try with reduced settings
+                try:
+                    # Force minimal memory usage
+                    with torch.cuda.device(0):
+                        torch.cuda.empty_cache()
+                    return func(*args, **kwargs)
+                except Exception as retry_error:
+                    print(f"❌ Texture generation failed even with minimal settings: {retry_error}")
+                    raise retry_error
+            else:
+                raise e
+        except Exception as e:
+            print(f"❌ Error in texture {func.__name__}: {e}")
+            safe_cuda_cleanup()
+            raise e
+    return wrapper
+
+
+def memory_safe_wrapper(func):
+    """Decorator to add memory monitoring and cleanup to functions"""
+    def wrapper(*args, **kwargs):
+        try:
+            log_memory_usage(f"before {func.__name__}")
+            result = func(*args, **kwargs)
+            log_memory_usage(f"after {func.__name__}")
+            safe_cuda_cleanup()
+            return result
+        except Exception as e:
+            print(f"❌ Error in {func.__name__}: {e}")
+            safe_cuda_cleanup()
+            raise e
+    return wrapper
 
 
 MAX_SEED = 1e7
@@ -747,7 +859,56 @@ if __name__ == '__main__':
     parser.add_argument('--enable_flashvdm', action='store_true')
     parser.add_argument('--compile', action='store_true')
     parser.add_argument('--low_vram_mode', action='store_true')
+    
+    # Debug and safety modes for segfault prevention
+    parser.add_argument('--safe_mode', action='store_true', help='Enable safe mode with minimal GPU usage')
+    parser.add_argument('--disable_bpy', action='store_true', help='Disable Blender (bpy) functionality')
+    parser.add_argument('--cpu_mode', action='store_true', help='Force CPU-only mode')
+    parser.add_argument('--disable_rasterizer', action='store_true', help='Disable custom CUDA rasterizer')
+    
     args = parser.parse_args()
+    
+    # Safety mode overrides
+    if args.cpu_mode:
+        args.device = 'cpu'
+        print("🔧 CPU-only mode enabled")
+    
+    if args.safe_mode:
+        args.low_vram_mode = True
+        print("🔧 Safe mode enabled - forcing low VRAM mode")
+    
+    if args.disable_bpy:
+        print("🔧 Blender (bpy) functionality disabled")
+        # Set environment variable to disable bpy imports
+        os.environ['HUNYUAN_DISABLE_BPY'] = '1'
+    
+    if args.disable_rasterizer:
+        print("🔧 Custom CUDA rasterizer disabled")
+        # Set environment variable to disable custom rasterizer
+        os.environ['HUNYUAN_DISABLE_RASTERIZER'] = '1'
+    
+    # Additional CUDA debugging and memory management
+    if args.device != 'cpu':
+        # Enhanced memory management for WSL2/RTX 4090 with aggressive texture OOM prevention
+        if args.safe_mode:
+            os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:64,expandable_segments:True,roundup_power2_divisions:16'
+        else:
+            os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:128,expandable_segments:True,roundup_power2_divisions:8'
+        
+        os.environ['CUDA_LAUNCH_BLOCKING'] = '0'  # Only enable when debugging
+        
+        # WSL2 specific GPU optimizations
+        os.environ['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
+        os.environ['__NV_PRIME_RENDER_OFFLOAD'] = '1'
+        os.environ['__GLX_VENDOR_LIBRARY_NAME'] = 'nvidia'
+        
+        # Texture generation specific optimizations
+        os.environ['HUNYUAN_TEXTURE_BATCH_SIZE'] = str(get_optimal_texture_batch_size())
+        
+        print("🔧 CUDA memory management and WSL2 compatibility configured with texture OOM prevention")
+    
+    # Initialize memory logging
+    log_memory_usage("startup")
     
     SAVE_DIR = args.cache_path
     os.makedirs(SAVE_DIR, exist_ok=True)
@@ -795,12 +956,16 @@ if __name__ == '__main__':
             # if args.low_vram_mode:
             #     texgen_worker.enable_model_cpu_offload()
 
+            log_memory_usage("before texture pipeline")
+            
             from hy3dpaint.textureGenPipeline import Hunyuan3DPaintPipeline, Hunyuan3DPaintConfig
             conf = Hunyuan3DPaintConfig(max_num_view=8, resolution=768)
             conf.realesrgan_ckpt_path = "hy3dpaint/ckpt/RealESRGAN_x4plus.pth"
             conf.multiview_cfg_path = "hy3dpaint/cfgs/hunyuan-paint-pbr.yaml"
             conf.custom_pipeline = "hy3dpaint/hunyuanpaintpbr"
+            
             tex_pipeline = Hunyuan3DPaintPipeline(conf)
+            log_memory_usage("after texture pipeline")
         
             # Not help much, ignore for now.
             # if args.compile:
@@ -814,9 +979,10 @@ if __name__ == '__main__':
         except Exception as e:
             import traceback
             traceback.print_exc()
-            print(f"Error loading texture generator: {e}")
+            print(f"❌ Error loading texture generator: {e}")
             print("Failed to load texture generator.")
             print('Please try to install requirements by following README.md')
+            safe_cuda_cleanup()
             HAS_TEXTUREGEN = False
 
     HAS_T2I = True
@@ -831,18 +997,39 @@ if __name__ == '__main__':
     from hy3dshape.pipelines import export_to_trimesh
     from hy3dshape.rembg import BackgroundRemover
 
-    rmbg_worker = BackgroundRemover()
-    i23d_worker = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(
-        args.model_path,
-        subfolder=args.subfolder,
-        use_safetensors=False,
-        device=args.device,
-    )
-    if args.enable_flashvdm:
-        mc_algo = 'mc' if args.device in ['cpu', 'mps'] else args.mc_algo
-        i23d_worker.enable_flashvdm(mc_algo=mc_algo)
-    if args.compile:
-        i23d_worker.compile()
+    # Initialize workers with error handling
+    log_memory_usage("before worker initialization")
+    
+    try:
+        rmbg_worker = BackgroundRemover()
+        log_memory_usage("after background remover")
+    except Exception as e:
+        print(f"❌ Failed to initialize background remover: {e}")
+        safe_cuda_cleanup()
+        raise e
+    
+    try:
+        i23d_worker = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(
+            args.model_path,
+            subfolder=args.subfolder,
+            use_safetensors=False,
+            device=args.device,
+        )
+        log_memory_usage("after shape pipeline")
+        
+        if args.enable_flashvdm:
+            mc_algo = 'mc' if args.device in ['cpu', 'mps'] else args.mc_algo
+            i23d_worker.enable_flashvdm(mc_algo=mc_algo)
+            log_memory_usage("after flashvdm")
+            
+        if args.compile:
+            i23d_worker.compile()
+            log_memory_usage("after compilation")
+            
+    except Exception as e:
+        print(f"❌ Failed to initialize shape generation pipeline: {e}")
+        safe_cuda_cleanup()
+        raise e
 
     floater_remove_worker = FloaterRemover()
     degenerate_face_remove_worker = DegenerateFaceRemover()

@@ -15,8 +15,35 @@
 
 import argparse, sys, os, math, re, glob
 from typing import *
-import bpy
-from mathutils import Vector, Matrix
+
+# Safe import of bpy with fallback
+try:
+    if os.environ.get('HUNYUAN_DISABLE_BPY') == '1':
+        print("🔧 Blender (bpy) functionality disabled by safety mode in render.py")
+        raise ImportError("BPY disabled by safety mode")
+    
+    import bpy
+    from mathutils import Vector, Matrix
+    BPY_AVAILABLE = True
+    print("✓ Blender (bpy) loaded successfully in render.py")
+except ImportError as e:
+    print(f"⚠️  bpy not available in render.py: {e}")
+    BPY_AVAILABLE = False
+    
+    # Mock classes for when bpy is not available
+    class Vector:
+        def __init__(self, *args):
+            pass
+    
+    class Matrix:
+        def __init__(self, *args):
+            pass
+            
+    class MockBpy:
+        pass
+    
+    bpy = MockBpy()
+
 import numpy as np
 import json
 import glob

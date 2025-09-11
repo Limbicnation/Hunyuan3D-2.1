@@ -14,7 +14,69 @@
 
 import os
 import cv2
-import bpy
+
+# Mock bpy implementation for systems without Blender
+BPY_AVAILABLE = False
+try:
+    if os.environ.get('HUNYUAN_DISABLE_BPY') == '1':
+        print("🔧 Blender (bpy) functionality disabled by safety mode")
+        BPY_AVAILABLE = False
+        bpy = None
+    else:
+        import bpy
+        BPY_AVAILABLE = True
+        print("✓ Blender (bpy) loaded successfully")
+except ImportError:
+    print("⚠️  bpy not available, using mock implementation for basic functionality")
+    BPY_AVAILABLE = False
+    bpy = None
+except Exception as e:
+    print(f"❌ bpy failed to load: {e}")
+    BPY_AVAILABLE = False
+    bpy = None
+
+# Define MockBpy class for fallback functionality
+if not BPY_AVAILABLE or bpy is None:
+    class MockBpy:
+        class ops:
+            class wm:
+                @staticmethod
+                def obj_import(filepath, **kwargs):
+                    pass
+                @staticmethod
+                def obj_export(filepath, **kwargs):
+                    pass
+            class export_scene:
+                @staticmethod
+                def gltf(**kwargs):
+                    pass
+                @staticmethod
+                def obj(**kwargs):
+                    pass
+            class import_scene:
+                @staticmethod
+                def obj(**kwargs):
+                    pass
+        
+        class data:
+            objects = []
+            meshes = []
+            materials = []
+            scenes = []
+        
+        class context:
+            scene = None
+            collection = None
+            view_layer = None
+            
+        @staticmethod
+        def _mock_func(*args, **kwargs):
+            pass
+    
+    # Assign MockBpy when real bpy is not available
+    if bpy is None:
+        bpy = MockBpy()
+
 import math
 import numpy as np
 from io import StringIO

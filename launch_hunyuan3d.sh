@@ -3,8 +3,6 @@
 # Hunyuan3D 2.1 Debug Launch Script
 # WSL compatibility fixes for RTX 4090 24GB with segfault debugging
 
-set -e  # Exit on any error
-
 # Parse command line arguments for different modes
 MODE="full"
 DEBUG=0
@@ -93,11 +91,33 @@ esac
 echo "📝 Executing: $CMD"
 echo "🔧 Use --debug for detailed debugging, --safe for minimal GPU usage"
 echo "🔧 Other modes: --no-bpy, --cpu-only, --minimal"
+echo "🔧 Press Ctrl+C to quit"
 
-# Create error handling wrapper
-handle_error() {
+# Cleanup function for graceful shutdown
+cleanup() {
   local exit_code=$?
-  echo "❌ Hunyuan3D crashed with exit code $exit_code"
+  if [ $exit_code -eq 130 ]; then
+    echo ""
+    echo "🛑 Received interrupt signal (Ctrl+C)"
+    echo "✓ Shutting down Hunyuan3D gracefully..."
+  fi
+  # Give Python time to cleanup before exiting
+  wait
+  exit $exit_code
+}
+
+# Error handler for crashes (not for normal interrupts)
+handle_crash() {
+  local exit_code=$?
+
+  # Don't treat SIGINT (130) or SIGTERM (143) as crashes
+  if [ $exit_code -eq 130 ] || [ $exit_code -eq 143 ]; then
+    return 0
+  fi
+
+  echo ""
+  echo "❌ Hunyuan3D exited unexpectedly with code $exit_code"
+
   if [ $exit_code -eq 139 ]; then
     echo "💥 Segmentation fault detected! Try these solutions:"
     echo "   1. Run with --safe mode: $0 --safe"
@@ -105,12 +125,41 @@ handle_error() {
     echo "   3. Use --minimal mode: $0 --minimal"
     echo "   4. Enable debugging: $0 --debug"
   fi
+
   exit $exit_code
 }
 
-trap handle_error ERR
+# Set up signal handlers
+# SIGINT (Ctrl+C) and SIGTERM should trigger cleanup
+trap cleanup SIGINT SIGTERM
 
-# Launch with timeout to prevent hanging
-timeout 300 $CMD || handle_error
+# Set up EXIT trap to handle crashes (but not normal exits)
+trap handle_crash EXIT
 
-echo "🎯 Hunyuan3D should now be accessible at http://localhost:7860"
+# Launch the Python application
+# Note: We don't use 'exec' here because we want our signal handlers to work
+$CMD &
+PYTHON_PID=$!
+
+# Wait for the Python process to complete
+# This allows us to capture its exit code and handle signals properly
+wait $PYTHON_PID
+EXIT_CODE=$?
+
+# Clear the EXIT trap to prevent handle_crash from running on normal exit
+trap - EXIT
+
+# Exit with the same code as the Python process
+# This ensures proper exit code propagation
+if [ $EXIT_CODE -eq 130 ] || [ $EXIT_CODE -eq 143 ]; then
+  # Normal interrupt, already handled by cleanup
+  echo "✓ Hunyuan3D stopped successfully"
+  exit 0
+elif [ $EXIT_CODE -eq 0 ]; then
+  # Normal successful exit
+  echo "✓ Hunyuan3D exited normally"
+  exit 0
+else
+  # Abnormal exit, trigger crash handler
+  handle_crash
+fi

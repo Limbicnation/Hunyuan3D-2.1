@@ -98,6 +98,54 @@ def get_optimal_texture_batch_size():
         print(f"⚠️  Error calculating batch size: {e}")
         return 1
 
+def get_optimal_texture_settings():
+    """Calculate optimal texture generation settings based on available CUDA memory"""
+    if not torch.cuda.is_available():
+        return {"max_num_view": 6, "resolution": 512}
+
+    try:
+        # Get total and currently allocated memory
+        total_memory = torch.cuda.get_device_properties(0).total_memory
+        allocated_memory = torch.cuda.memory_allocated(0)
+        available_memory = total_memory - allocated_memory
+        available_gb = available_memory / (1024**3)
+
+        # Dynamic settings based on available memory
+        if available_gb >= 4.0:  # High memory mode
+            settings = {
+                "max_num_view": 8,
+                "resolution": 768,
+                "render_size": 1024 * 2,  # 2048px
+                "texture_size": 1024 * 4  # 4096px
+            }
+            print(f"🎯 High quality texture mode: {available_gb:.1f}GB available")
+        elif available_gb >= 2.0:  # Standard memory mode
+            settings = {
+                "max_num_view": 6,
+                "resolution": 512,
+                "render_size": 1024,      # 1024px
+                "texture_size": 1024 * 2  # 2048px
+            }
+            print(f"🎯 Standard quality texture mode: {available_gb:.1f}GB available")
+        else:  # Low memory mode
+            settings = {
+                "max_num_view": 4,
+                "resolution": 384,
+                "render_size": 512,       # 512px
+                "texture_size": 1024      # 1024px
+            }
+            print(f"🎯 Low quality texture mode: {available_gb:.1f}GB available")
+
+        return settings
+    except Exception as e:
+        print(f"⚠️  Could not determine optimal texture settings, using defaults: {e}")
+        return {
+            "max_num_view": 4,
+            "resolution": 384,
+            "render_size": 512,
+            "texture_size": 1024
+        }
+
 
 def memory_efficient_texture_wrapper(func):
     """Decorator to add aggressive memory management for texture generation"""
@@ -487,10 +535,95 @@ def generation_all(
     logger.info("---Face Reduction takes %s seconds ---" % (time.time() - tmp_time))
     stats['time']['face reduction'] = time.time() - tmp_time
 
+    # Aggressive memory cleanup before texture generation to prevent CUDA OOM
+    log_memory_usage("before texture cleanup")
+    safe_cuda_cleanup()
+
+    # Offload shape generation models to CPU to free GPU memory for texture generation
+    try:
+        if hasattr(i23d_worker, 'unet') and hasattr(i23d_worker.unet, 'to'):
+            print("📤 Offloading shape generation UNet to CPU...")
+            i23d_worker.unet.to('cpu')
+        if hasattr(i23d_worker, 'vae') and hasattr(i23d_worker.vae, 'to'):
+            print("📤 Offloading shape generation VAE to CPU...")
+            i23d_worker.vae.to('cpu')
+        if hasattr(i23d_worker, 'text_encoder') and hasattr(i23d_worker.text_encoder, 'to'):
+            print("📤 Offloading text encoder to CPU...")
+            i23d_worker.text_encoder.to('cpu')
+    except Exception as e:
+        print(f"⚠️  Warning during model offloading: {e}")
+
+    # Force garbage collection and additional CUDA optimizations for texture generation
+    import gc
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        torch.cuda.ipc_collect()  # Clean up shared memory
+    log_memory_usage("after texture cleanup and model offloading")
+
     tmp_time = time.time()
 
     text_path = os.path.join(save_folder, f'textured_mesh.obj')
-    path_textured = tex_pipeline(mesh_path=path, image_path=image, output_mesh_path=text_path, save_glb=False)
+
+    # Enhanced error recovery with progressive quality reduction
+    path_textured = None
+    retry_count = 0
+    max_retries = 3
+
+    while path_textured is None and retry_count < max_retries:
+        try:
+            path_textured = tex_pipeline(mesh_path=path, image_path=image, output_mesh_path=text_path, save_glb=False)
+            if path_textured:
+                print(f"✅ Texture generation successful on attempt {retry_count + 1}")
+                break
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                retry_count += 1
+                print(f"❌ CUDA OOM Error on attempt {retry_count}/{max_retries}: {str(e)}")
+
+                if retry_count < max_retries:
+                    # Progressive quality reduction for retries
+                    print(f"🔄 Retrying with reduced settings (attempt {retry_count + 1}/{max_retries})...")
+
+                    # Aggressive cleanup before retry
+                    safe_cuda_cleanup()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                        torch.cuda.synchronize()
+
+                    # Get progressively lower quality settings
+                    if retry_count == 1:  # First retry: reduce by one level
+                        fallback_settings = {"max_num_view": 4, "resolution": 384, "render_size": 512, "texture_size": 1024}
+                    elif retry_count == 2:  # Second retry: minimal settings
+                        fallback_settings = {"max_num_view": 2, "resolution": 256, "render_size": 256, "texture_size": 512}
+
+                    print(f"🎯 Fallback settings: {fallback_settings}")
+
+                    # Recreate pipeline with reduced settings
+                    from hy3dpaint.textureGenPipeline import Hunyuan3DPaintPipeline, Hunyuan3DPaintConfig
+                    conf_fallback = Hunyuan3DPaintConfig(
+                        max_num_view=fallback_settings["max_num_view"],
+                        resolution=fallback_settings["resolution"],
+                        render_size=fallback_settings["render_size"],
+                        texture_size=fallback_settings["texture_size"]
+                    )
+                    conf_fallback.realesrgan_ckpt_path = "hy3dpaint/ckpt/RealESRGAN_x4plus.pth"
+                    conf_fallback.multiview_cfg_path = "hy3dpaint/cfgs/hunyuan-paint-pbr.yaml"
+                    conf_fallback.custom_pipeline = "hy3dpaint/hunyuanpaintpbr"
+
+                    # Replace tex_pipeline for retry
+                    tex_pipeline = Hunyuan3DPaintPipeline(conf_fallback)
+                else:
+                    print("❌ Maximum retries exceeded. Texture generation failed.")
+                    raise e
+            else:
+                # Non-memory related error, don't retry
+                print(f"❌ Non-memory error in texture generation: {str(e)}")
+                raise e
+        except Exception as e:
+            print(f"❌ Unexpected error in texture generation: {str(e)}")
+            raise e
         
     logger.info("---Texture Generation takes %s seconds ---" % (time.time() - tmp_time))
     stats['time']['texture generation'] = time.time() - tmp_time
@@ -959,7 +1092,15 @@ if __name__ == '__main__':
             log_memory_usage("before texture pipeline")
             
             from hy3dpaint.textureGenPipeline import Hunyuan3DPaintPipeline, Hunyuan3DPaintConfig
-            conf = Hunyuan3DPaintConfig(max_num_view=8, resolution=768)
+
+            # Dynamic texture settings based on available GPU memory
+            optimal_settings = get_optimal_texture_settings()
+            conf = Hunyuan3DPaintConfig(
+                max_num_view=optimal_settings["max_num_view"],
+                resolution=optimal_settings["resolution"],
+                render_size=optimal_settings.get("render_size"),
+                texture_size=optimal_settings.get("texture_size")
+            )
             conf.realesrgan_ckpt_path = "hy3dpaint/ckpt/RealESRGAN_x4plus.pth"
             conf.multiview_cfg_path = "hy3dpaint/cfgs/hunyuan-paint-pbr.yaml"
             conf.custom_pipeline = "hy3dpaint/hunyuanpaintpbr"

@@ -35,7 +35,7 @@ diffusers_logging.set_verbosity(50)
 
 
 class Hunyuan3DPaintConfig:
-    def __init__(self, max_num_view, resolution):
+    def __init__(self, max_num_view, resolution, render_size=None, texture_size=None):
         self.device = "cuda"
 
         self.multiview_cfg_path = "hy3dpaint/cfgs/hunyuan-paint-pbr.yaml"
@@ -46,8 +46,9 @@ class Hunyuan3DPaintConfig:
 
         self.raster_mode = "cr"
         self.bake_mode = "back_sample"
-        self.render_size = 1024 * 2
-        self.texture_size = 1024 * 4
+        # Use dynamic render/texture sizes if provided, otherwise use defaults
+        self.render_size = render_size if render_size is not None else 1024 * 2
+        self.texture_size = texture_size if texture_size is not None else 1024 * 4
         self.max_selected_view_num = max_num_view
         self.resolution = resolution
         self.bake_exp = 4
@@ -86,7 +87,9 @@ class Hunyuan3DPaintPipeline:
     def load_models(self):
         torch.cuda.empty_cache()
         self.models["super_model"] = imageSuperNet(self.config)
+        torch.cuda.empty_cache()  # Clear cache between model loads
         self.models["multiview_model"] = multiviewDiffusionNet(self.config)
+        torch.cuda.empty_cache()  # Final cleanup after loading
         print("Models Loaded.")
 
     @torch.no_grad()
@@ -152,6 +155,9 @@ class Hunyuan3DPaintPipeline:
             custom_view_size=self.config.resolution,
             resize_input=True,
         )
+        # Clear CUDA cache after multiview generation
+        torch.cuda.empty_cache()
+
         ###########  Enhance  ##########
         enhance_images = {}
         enhance_images["albedo"] = copy.deepcopy(multiviews_pbr["albedo"])
@@ -160,6 +166,9 @@ class Hunyuan3DPaintPipeline:
         for i in range(len(enhance_images["albedo"])):
             enhance_images["albedo"][i] = self.models["super_model"](enhance_images["albedo"][i])
             enhance_images["mr"][i] = self.models["super_model"](enhance_images["mr"][i])
+
+        # Clear CUDA cache after enhancement
+        torch.cuda.empty_cache()
 
         ###########  Bake  ##########
         for i in range(len(enhance_images)):

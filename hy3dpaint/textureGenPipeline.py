@@ -90,6 +90,11 @@ class Hunyuan3DPaintPipeline:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
+            # Try to release IPC memory handles if available
+            try:
+                torch.cuda.ipc_collect()
+            except (AttributeError, RuntimeError):
+                pass  # Not available in all PyTorch versions
         gc.collect()
 
     def load_models(self):

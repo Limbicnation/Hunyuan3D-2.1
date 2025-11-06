@@ -34,4 +34,15 @@ def mesh_simplify_trimesh(inputpath, outputpath, target_count=40000):
 
     if face_num > target_count:
         courent = courent.simplify_quadric_decimation(target_count)
-    courent.export(outputpath)
+
+    # Export with explicit format handling
+    if outputpath.endswith(".glb"):
+        try:
+            courent.export(outputpath, file_type='glb')
+        except Exception as e:
+            print(f"Warning: GLB export failed, exporting as OBJ instead: {e}")
+            obj_path = outputpath.replace(".glb", ".obj")
+            courent.export(obj_path, file_type='obj')
+            print(f"Exported to {obj_path} instead of {outputpath}")
+    else:
+        courent.export(outputpath)

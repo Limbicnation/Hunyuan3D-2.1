@@ -55,11 +55,27 @@ def create_glb_with_pbr_materials(obj_path, textures_dict, output_path):
     mesh = trimesh.load(obj_path)
 
     # 2. 先导出为临时GLB
+    # Note: Some meshes export as OBJ even with .glb extension, so we validate
     temp_glb = "temp.glb"
-    mesh.export(temp_glb)
+    try:
+        mesh.export(temp_glb, file_type='glb')
+    except Exception as e:
+        print(f"Warning: GLB export failed, trying OBJ: {e}")
+        temp_glb = "temp.obj"
+        mesh.export(temp_glb)
 
     # 3. 加载GLB文件进行材质编辑
-    gltf = pygltflib.GLTF2().load(temp_glb)
+    # If temp file is OBJ, convert to GLB first
+    if temp_glb.endswith('.obj'):
+        mesh_for_glb = trimesh.load(temp_glb)
+        temp_glb_actual = "temp_actual.glb"
+        mesh_for_glb.export(temp_glb_actual, file_type='glb')
+        temp_glb = temp_glb_actual
+
+    try:
+        gltf = pygltflib.GLTF2().load(temp_glb)
+    except Exception as e:
+        raise ValueError(f"Failed to load GLB file. The mesh may not support GLB format: {e}")
 
     # 4. 准备纹理数据
     def image_to_data_uri(image_path):

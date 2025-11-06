@@ -142,6 +142,14 @@ python3 gradio_app.py \
   --low_vram_mode
 ```
 
+### Batch Processing
+
+You can process multiple images at once using the `batch_process.py` script. The script will generate a 3D mesh with PBR textures for each image in the input directory.
+
+```bash
+python batch_process.py --input_dir ./my_images --output_dir ./output_meshes
+```
+
 
 ## 🔗 BibTeX
 

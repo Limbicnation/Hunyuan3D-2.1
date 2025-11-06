@@ -183,3 +183,12 @@ demo_untextured.glb
 white_mesh_remesh.obj
 hy3dpaint/ckpt/
 
+# User-generated files
+.claude/
+mr_combined.png
+my_images/
+output_meshes/
+save_dir/
+temp.glb
+test_output/
+test_single/

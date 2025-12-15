@@ -5,6 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Project Overview
 
 Hunyuan3D-2.1 is a production-ready AI system for generating textured 3D assets from single images. Two-stage pipeline:
+
 - **Hunyuan3D-Shape (3.3B params)**: Image-to-3D mesh via Diffusion Transformer with flow matching
 - **Hunyuan3D-Paint (2B params)**: PBR texture synthesis via multiview diffusion (albedo, metallic, roughness, normal maps)
 
@@ -31,47 +32,75 @@ wget https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_
 
 ## Running the Pipeline
 
+### Quick Demo
+
 ```bash
-# Quick test - full pipeline
 python demo.py
+```
 
-# Web UI (Gradio)
-python gradio_app.py --model_path tencent/Hunyuan3D-2.1 --low_vram_mode
+### Gradio Web App
 
-# Batch processing
+**Quick Start** (uses `hunyuan3d2.1` conda environment):
+
+```bash
+./run_gradio.sh
+```
+
+**Manual Launch**:
+
+```bash
+python3 gradio_app.py \
+  --model_path tencent/Hunyuan3D-2.1 \
+  --subfolder hunyuan3d-dit-v2-1 \
+  --texgen_model_path tencent/Hunyuan3D-2.1 \
+  --low_vram_mode
+```
+
+Access at: `http://localhost:8082`
+
+### Batch Processing
+
+```bash
 python batch_process.py --input_dir ./my_images --output_dir ./output --resume
+```
 
-# REST API server
+### REST API Server
+
+```bash
 python api_server.py  # http://localhost:8081/docs
+```
 
-# Shape-only test
-python hy3dshape/minimal_demo.py
+### Testing
 
-# Texture-only test
-python hy3dpaint/demo.py
-
-# API tests
-python test_api_server.py
+```bash
+python hy3dshape/minimal_demo.py  # Shape-only test
+python hy3dpaint/demo.py          # Texture-only test
+python test_api_server.py         # API tests
 ```
 
 ## Architecture
 
 ### Pipeline Flow
-```
+
+```text
+
 Input Image → Background Removal (rembg) → DINOv2 Encoder → DiT Denoiser → ShapeVAE → Marching Cubes → 3D Mesh
      ↓
 Mesh + Image → UV Unwrap (xatlas) → Multiview Rendering → UNet2.5D Diffusion → PBR Textures → GLB Export
+
 ```
 
 ### Key Modules
 
 **hy3dshape/** - Shape generation
+
 - `hy3dshape/pipelines.py` - Main pipeline: `Hunyuan3DDiTFlowMatchingPipeline`
 - `hy3dshape/models/denoisers/hunyuan3ddit.py` - DiT architecture with MOE layers
 - `hy3dshape/models/autoencoders/model.py` - ShapeVAE decoder
 - `hy3dshape/models/autoencoders/surface_extractors.py` - Marching Cubes variants
 
 **hy3dpaint/** - Texture generation
+
 - `textureGenPipeline.py` - Main pipeline: `Hunyuan3DPaintPipeline`
 - `hunyuanpaintpbr/pipeline.py` - HunyuanPaintPipeline (extends StableDiffusion)
 - `hunyuanpaintpbr/unet/model.py` - UNet2.5D with position-aware RoPE attention
@@ -79,19 +108,24 @@ Mesh + Image → UV Unwrap (xatlas) → Multiview Rendering → UNet2.5D Diffusi
 - `custom_rasterizer/` - CUDA rasterizer kernel
 
 ### Entry Points
+
 ```
+
 demo.py              - Simple full pipeline demo
 gradio_app.py        - Web UI (port 7860)
 batch_process.py     - Batch processing with resume
 api_server.py        - REST API (port 8081)
 hy3dshape/main.py    - Shape model training
 hy3dpaint/train.py   - Texture model training
+
 ```
 
 ## Critical Implementation Details
 
 ### 1. Path Configuration (REQUIRED)
+
 All scripts must configure paths before imports:
+
 ```python
 import sys
 sys.path.insert(0, './hy3dshape')
@@ -99,7 +133,9 @@ sys.path.insert(0, './hy3dpaint')
 ```
 
 ### 2. Torchvision Compatibility Fix
+
 Apply early in scripts:
+
 ```python
 try:
     from torchvision_fix import apply_fix
@@ -109,6 +145,7 @@ except ImportError:
 ```
 
 ### 3. Model Loading (CRITICAL)
+
 ```python
 # CORRECT - pass device to from_pretrained
 shape_pipeline = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(
@@ -122,7 +159,9 @@ shape_pipeline = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(
 ```
 
 ### 4. Intermediate Mesh Format (CRITICAL)
+
 Texture pipeline requires OBJ format for intermediate meshes (not GLB):
+
 ```python
 # Shape output - use OBJ
 mesh.export('output.obj')  # NOT .glb
@@ -134,6 +173,7 @@ paint_pipeline(mesh_path='output.obj', ...)
 ```
 
 ### 5. CUDA Memory Management
+
 ```python
 import os
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
@@ -146,6 +186,7 @@ torch.cuda.synchronize()
 ## Training
 
 ### Shape Model
+
 ```bash
 cd hy3dshape
 export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
@@ -157,6 +198,7 @@ bash scripts/train_deepspeed.sh 1 0 8 0.0.0.0 $config $output_dir
 Data structure: `dataset/preprocessed/{uid}/geo_data/` (SDF volumes) + `render_cond/` (24 views)
 
 ### Texture Model
+
 ```bash
 python3 hy3dpaint/train.py \
   --base hy3dpaint/cfgs/hunyuan-paint-pbr.yaml \
@@ -169,6 +211,7 @@ Data structure: `train_examples/{uid}/render_tex/` (RGB, albedo, metallic-roughn
 ## Configuration Presets
 
 ### Shape Generation
+
 ```python
 # Fast: num_inference_steps=5, octree_resolution=128
 # Balanced: num_inference_steps=50, octree_resolution=256
@@ -176,6 +219,7 @@ Data structure: `train_examples/{uid}/render_tex/` (RGB, albedo, metallic-roughn
 ```
 
 ### Texture Generation
+
 ```python
 Hunyuan3DPaintConfig(
     max_num_view=6,    # 6-12 (more views = better quality, more VRAM)
@@ -209,4 +253,4 @@ docker run -it --name hy3d21 -p 7860:7860 --gpus all hunyuan3d21 python gradio_a
 - `GET /status/{uid}` - Check task status
 - `GET /health` - Health check
 
-Interactive docs: http://localhost:8081/docs
+Interactive docs: <http://localhost:8081/docs>

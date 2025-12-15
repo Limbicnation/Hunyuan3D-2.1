@@ -11,6 +11,19 @@ Hunyuan3D-2.1 is a production-ready AI system for generating textured 3D assets 
 
 VRAM: 10GB (shape only), 21GB (texture only), 29GB (full pipeline)
 
+## Fork Information
+
+This is a fork: `Limbicnation/Hunyuan3D-2.1`
+
+**Conda environment**: `hunyuan3d2.1`
+
+**Fixes applied to batch_process.py** (not in upstream):
+1. Added `sys.path.insert(0, './hy3dpaint')` for hunyuanpaintpbr module imports
+2. Fixed model loading: use `device='cuda'` in `from_pretrained()` instead of `.to('cuda')` (which returns None)
+3. Changed intermediate mesh format from GLB to OBJ for pymeshlab compatibility
+4. Added torchvision compatibility fix import
+5. Added CUDA memory allocator config (`expandable_segments:True`)
+
 ## Build & Setup
 
 ```bash
